@@ -24,32 +24,26 @@
 
 namespace Stockfish::Attacks {
 
-namespace {
-
 Bitboard LineBB[SQUARE_NB][SQUARE_NB];
 Bitboard BetweenBB[SQUARE_NB][SQUARE_NB];
-Bitboard RayPassBB[SQUARE_NB][SQUARE_NB];
+Bitboard inverse_RayPassBB[SQUARE_NB][SQUARE_NB];
+Bitboard DiagBB[SQUARE_NB];
+Bitboard AntiDiagBB[SQUARE_NB];
 
-#ifdef USE_DUAL_HYPERBOLA_QUINT
-alignas(64) DualMagic DualMagics[SQUARE_NB];
-#else
+namespace {
+
+#ifndef USE_DUAL_HYPERBOLA_QUINT
 alignas(64) Magic Magics[SQUARE_NB][2];
 #endif
 
 }
 
-#ifdef USE_PEXT
-using MagicMask = uint16_t;
-#else
-using MagicMask = Bitboard;
-#endif
-
-[[maybe_unused]] static Bitboard line_mask(Square sq, Direction d1, Direction d2) {
-    Bitboard mask = 0, dest;
+[[maybe_unused]] static constexpr Bitboard line_mask(Square sq, Direction d1, Direction d2) {
+    Bitboard mask = 0;
     for (Direction d : {d1, d2})
     {
         Square s = sq;
-        while ((dest = safe_destination(s, d)))
+        while (Bitboard dest = safe_destination(s, d))
         {
             mask |= dest;
             s += d;
@@ -69,40 +63,24 @@ static void init_magics(Magic magics[][2]) {
         Magic& bishop = magics[s][BISHOP - BISHOP];
         bishop.mask1  = line_mask(s, NORTH_EAST, SOUTH_WEST);
         bishop.mask2  = line_mask(s, NORTH_WEST, SOUTH_EAST);
-
-        rook.r = bishop.r = square_bb(s) * 2;
-        rook.rr = bishop.rr = square_bb(Square(63 - int(s))) * 2;
     }
 }
 
 #elif defined(USE_DUAL_HYPERBOLA_QUINT)
 
 // Sliding attacks within a rank, indexed by the slider's file and the
-// 8-bit rank occupancy, yielding the 8-bit attack set on that rank
-constexpr auto RankAttacks = []() {
-    std::array<std::array<uint8_t, 256>, FILE_NB> table{};
+// 6 inner bits of the rank occupancy (edge squares never affect the
+// attack set), yielding the 8-bit attack set on that rank
+alignas(64) constexpr auto RankAttacks = []() {
+    std::array<std::array<u8, 64>, FILE_NB> table{};
     for (int file = 0; file < 8; ++file)
-        for (int occ = 0; occ < 256; ++occ)
-        {
-            uint8_t attacks = 0;
-            for (int f = file + 1; f <= 7; ++f)
-            {
-                attacks |= uint8_t(1 << f);
-                if (occ & (1 << f))
-                    break;
-            }
-            for (int f = file - 1; f >= 0; --f)
-            {
-                attacks |= uint8_t(1 << f);
-                if (occ & (1 << f))
-                    break;
-            }
-            table[file][occ] = attacks;
-        }
+        for (int occ6 = 0; occ6 < 64; ++occ6)
+            table[file][occ6] = u8(sliding_attack(ROOK, Square(file), occ6 << 1));
     return table;
 }();
 
-static void init_dual_magics(DualMagic magics[]) {
+static constexpr auto make_dual_magics() {
+    std::array<DualMagic, SQUARE_NB> magics{};
     for (Square s = SQ_A1; s <= SQ_H8; ++s)
     {
         DualMagic& m        = magics[s];
@@ -115,43 +93,23 @@ static void init_dual_magics(DualMagic magics[]) {
         m.rankAttacksLookup = RankAttacks[int(file_of(s))].data();
         m.shift             = 8 * int(rank_of(s));
     }
+    return magics;
 }
+
+alignas(64) extern constexpr std::array<DualMagic, SQUARE_NB> DualMagics = make_dual_magics();
 
 #else
 
 namespace {
-[[maybe_unused]] constexpr Bitboard constexpr_pext(Bitboard b, Bitboard m) {
-    Bitboard result = 0, bit = 0;
-    while (m)
-    {
-        Bitboard last = m & -m;
-        result |= bool(b & last) << bit++;
-        m ^= last;
-    }
-    return result;
-}
+void init_magics(PieceType pt, Bitboard table[], Magic magics[][2]) {
 
-    #ifdef USE_COMPTIME_ATTACKS
-constexpr
-    #endif
-  void
-  init_magics(PieceType             pt,
-              MagicMask             table[],
-              Magic                 magics[][2],
-              [[maybe_unused]] bool tableAlreadyInit) {
-    #if !defined(USE_COMPTIME_ATTACKS)
-    tableAlreadyInit = false;
-    #endif
-
-    #ifndef USE_PEXT
     int seeds[][RANK_NB] = {{8977, 44560, 54343, 38998, 5731, 95205, 104912, 17020},
                             {728, 10316, 55013, 32803, 12281, 15100, 16645, 255}};
 
     Bitboard occupancy[4096];
     int      epoch[4096] = {}, cnt = 0;
     Bitboard reference[4096] = {};
-    #endif
-    int size = 0;
+    int      size            = 0;
 
     for (Square s = SQ_A1; s <= SQ_H8; ++s)
     {
@@ -160,36 +118,20 @@ constexpr
         Magic&   m       = magics[s][pt - BISHOP];
         Bitboard attacks = sliding_attack(pt, s, 0);
         m.mask           = attacks & ~edges;
-    #ifdef USE_PEXT
-        m.pseudoAttacks = attacks;
-    #else
-        m.shift = (Is64Bit ? 64 : 32) - popcount(m.mask);
-    #endif
-        m.attacks = s == SQ_A1 ? table : magics[s - 1][pt - BISHOP].attacks + size;
-        size      = 0;
+        m.shift          = (Is64Bit ? 64 : 32) - popcount(m.mask);
+        m.attacks        = s == SQ_A1 ? table : magics[s - 1][pt - BISHOP].attacks + size;
+        size             = 0;
 
-        Bitboard                  b           = 0;
-        [[maybe_unused]] Bitboard prevSliding = -1;
+        Bitboard b = 0;
         do
         {
-    #ifdef USE_PEXT
-            if (!tableAlreadyInit)
-            {
-                Bitboard sliding = sliding_attack(pt, s, b);
-                m.attacks[size] =
-                  sliding != prevSliding ? constexpr_pext(sliding, attacks) : m.attacks[size - 1];
-                prevSliding = sliding;
-            }
-    #else
             occupancy[size] = b;
             reference[size] = sliding_attack(pt, s, b);
-    #endif
 
             size++;
             b = (b - m.mask) & m.mask;
         } while (b);
 
-    #ifndef USE_PEXT
         PRNG rng(seeds[Is64Bit][rank_of(s)]);
 
         for (int i = 0; i < size;)
@@ -210,26 +152,12 @@ constexpr
                     break;
             }
         }
-    #endif
     }
 }
 
-    #if defined(USE_COMPTIME_ATTACKS) && defined(USE_PEXT)
-constexpr auto RookTable = []() {
-    std::array<uint16_t, 0x19000> result{};
-    Magic                         magics[64][2] = {};
-    init_magics(ROOK, result.data(), magics, false);
-    return result;
-}();
-constexpr auto BishopTable = []() {
-    std::array<uint16_t, 0x1480> result{};
-    Magic                        magics[64][2] = {};
-    init_magics(BISHOP, result.data(), magics, false);
-    return result;
-}();
-    #elif !defined(USE_DUAL_HYPERBOLA_QUINT) && !defined(USE_HYPERBOLA_QUINT)
-std::array<MagicMask, 0x19000> RookTable;
-std::array<MagicMask, 0x1480>  BishopTable;
+    #if !defined(USE_DUAL_HYPERBOLA_QUINT) && !defined(USE_HYPERBOLA_QUINT)
+static std::array<Bitboard, 0x19000> RookTable;
+static std::array<Bitboard, 0x1480>  BishopTable;
     #endif
 }
 
@@ -239,11 +167,9 @@ void init() {
 
 #ifdef USE_HYPERBOLA_QUINT
     init_magics(Magics);
-#elif defined(USE_DUAL_HYPERBOLA_QUINT)
-    init_dual_magics(DualMagics);
-#else
-    init_magics(ROOK, const_cast<MagicMask*>(RookTable.data()), Magics, true);
-    init_magics(BISHOP, const_cast<MagicMask*>(BishopTable.data()), Magics, true);
+#elif !defined(USE_DUAL_HYPERBOLA_QUINT)
+    init_magics(ROOK, RookTable.data(), Magics);
+    init_magics(BISHOP, BishopTable.data(), Magics);
 #endif
 
     for (Square s1 = SQ_A1; s1 <= SQ_H8; ++s1)
@@ -256,36 +182,22 @@ void init() {
                     LineBB[s1][s2] = (attacks_bb(pt, s1, 0) & attacks_bb(pt, s2, 0)) | s1 | s2;
                     BetweenBB[s1][s2] =
                       (attacks_bb(pt, s1, square_bb(s2)) & attacks_bb(pt, s2, square_bb(s1)));
-                    RayPassBB[s1][s2] =
+                    inverse_RayPassBB[s2][s1] =
                       attacks_bb(pt, s1, 0) & (attacks_bb(pt, s2, square_bb(s1)) | s2);
                 }
                 BetweenBB[s1][s2] |= s2;
             }
+
+        DiagBB[s1]     = line_mask(s1, NORTH_EAST, SOUTH_WEST) | s1;
+        AntiDiagBB[s1] = line_mask(s1, NORTH_WEST, SOUTH_EAST) | s1;
     }
 }
 
-#ifdef USE_DUAL_HYPERBOLA_QUINT
-const DualMagic& dual_magic(Square s) { return DualMagics[s]; }
-#else
+#ifndef USE_DUAL_HYPERBOLA_QUINT
 const Magic& magic(Square s, PieceType pt) {
     assert((pt == BISHOP || pt == ROOK) && is_ok(s));
     return Magics[s][pt - BISHOP];
 }
 #endif
-
-Bitboard line_bb(Square s1, Square s2) {
-    assert(is_ok(s1) && is_ok(s2));
-    return LineBB[s1][s2];
-}
-
-Bitboard between_bb(Square s1, Square s2) {
-    assert(is_ok(s1) && is_ok(s2));
-    return BetweenBB[s1][s2];
-}
-
-Bitboard ray_pass_bb(Square s1, Square s2) {
-    assert(is_ok(s1) && is_ok(s2));
-    return RayPassBB[s1][s2];
-}
 
 }  // namespace Stockfish::Attacks

@@ -17,11 +17,15 @@
 */
 
 #include "benchmark.h"
+#include "engine.h"
 #include "numa.h"
+#include "misc.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -422,8 +426,6 @@ std::vector<std::string> setup_bench(const std::string& currentFen, std::istream
         while (getline(file, fen))
             if (!fen.empty())
                 fens.push_back(fen);
-
-        file.close();
     }
 
     list.emplace_back("setoption name Threads value " + threads);
@@ -449,25 +451,45 @@ BenchmarkSetup setup_benchmark(std::istream& is) {
 
     static constexpr int DEFAULT_DURATION_S = 150;
 
+    static constexpr int MaxDurationS = std::numeric_limits<int>::max() / 1000;
+
     BenchmarkSetup setup{};
 
-    // Assign default values to missing arguments
-    int desiredTimeS;
+    auto clamped = [](const char* what, i64 value, i64 lo, i64 hi) {
+        const i64 fixed = std::clamp(value, lo, hi);
+        if (fixed != value)
+            std::cerr << "info string speedtest: " << what << ' ' << value << " is outside [" << lo
+                      << ", " << hi << "]; using " << fixed << std::endl;
+        return int(fixed);
+    };
 
-    if (!(is >> setup.threads))
+    // Assign default values to missing arguments
+    i64 desiredTimeS;
+    i64 requested;
+
+    if (!(is >> requested))
         setup.threads = int(get_hardware_concurrency());
     else
+    {
+        setup.threads = clamped("threads", requested, 1, MaxThreads);
         setup.originalInvocation += std::to_string(setup.threads);
+    }
 
-    if (!(is >> setup.ttSize))
-        setup.ttSize = TT_SIZE_PER_THREAD * setup.threads;
+    if (!(is >> requested))
+        setup.ttSize = clamped("hash", i64(TT_SIZE_PER_THREAD) * setup.threads, 1, MaxHashMB);
     else
+    {
+        setup.ttSize = clamped("hash", requested, 1, MaxHashMB);
         setup.originalInvocation += " " + std::to_string(setup.ttSize);
+    }
 
     if (!(is >> desiredTimeS))
         desiredTimeS = DEFAULT_DURATION_S;
     else
+    {
+        desiredTimeS = clamped("seconds", desiredTimeS, 1, MaxDurationS);
         setup.originalInvocation += " " + std::to_string(desiredTimeS);
+    }
 
     setup.filledInvocation += std::to_string(setup.threads) + " " + std::to_string(setup.ttSize)
                             + " " + std::to_string(desiredTimeS);
@@ -483,8 +505,8 @@ BenchmarkSetup setup_benchmark(std::istream& is) {
 
     float totalTime = 0;
     for (const auto& game : BenchmarkPositions)
-        for (size_t i = 0; i < game.size(); ++i)
-            totalTime += float(getCorrectedTime(i + 1));
+        for (usize i = 0; i < game.size(); ++i)
+            totalTime += float(getCorrectedTime(int(i + 1)));
 
     float timeScaleFactor = static_cast<float>(desiredTimeS * 1000) / totalTime;
 
@@ -503,4 +525,4 @@ BenchmarkSetup setup_benchmark(std::istream& is) {
     return setup;
 }
 
-}  // namespace Stockfish
+}  // namespace Stockfish::Benchmark

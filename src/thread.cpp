@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <deque>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <string>
@@ -45,17 +46,23 @@ namespace Stockfish {
 
 // Constructor launches the thread and waits until it goes to sleep
 // in idle_loop(). Note that 'searching' and 'exit' should be already set.
-Thread::Thread(Search::SharedState&                    sharedState,
-               std::unique_ptr<Search::ISearchManager> sm,
-               size_t                                  n,
-               size_t                                  numaN,
-               size_t                                  totalNumaCount,
-               OptionalThreadToNumaNodeBinder          binder) :
+Thread::Thread(Search::SharedState&                   sharedState,
+               std::unique_ptr<Search::SearchManager> sm,
+               usize                                  n,
+               usize                                  numaN,
+               usize                                  totalNumaCount,
+               OptionalThreadToNumaNodeBinder         binder) :
     idx(n),
     idxInNuma(numaN),
     totalNuma(totalNumaCount),
-    nthreads(sharedState.options["Threads"]),
-    stdThread(&Thread::idle_loop, this) {
+    stdThread(
+      create_native_thread(NativeThreadOptions{}.setLargeStack(true), &Thread::idle_loop, this)) {
+
+    if (!stdThread.joinable())
+    {
+        std::cerr << "Failed to create search thread\n";
+        std::exit(EXIT_FAILURE);
+    }
 
     wait_for_search_finished();
 
@@ -141,10 +148,10 @@ void Thread::idle_loop() {
 
 Search::SearchManager* ThreadPool::main_manager() { return main_thread()->worker->main_manager(); }
 
-uint64_t ThreadPool::nodes_searched() const { return accumulate(&Search::Worker::nodes); }
-uint64_t ThreadPool::tb_hits() const { return accumulate(&Search::Worker::tbHits); }
+u64 ThreadPool::nodes_searched() const { return accumulate(&Search::Worker::nodes); }
+u64 ThreadPool::tb_hits() const { return accumulate(&Search::Worker::tbHits); }
 
-static size_t next_power_of_two(uint64_t count) { return count > 1 ? (2ULL << msb(count - 1)) : 1; }
+static usize next_power_of_two(u64 count) { return count > 1 ? (2ULL << msb(count - 1)) : 1; }
 
 // Creates/destroys threads to match the requested number.
 // Created and launched threads will immediately go to sleep in idle_loop.
@@ -162,7 +169,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
         boundThreadToNumaNode.clear();
     }
 
-    const size_t requested = sharedState.options["Threads"];
+    const usize requested = sharedState.options["Threads"];
 
     if (requested > 0)  // create new thread(s)
     {
@@ -184,7 +191,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
             return true;
         }();
 
-        std::map<NumaIndex, size_t> counts;
+        std::map<NumaIndex, usize> counts;
         boundThreadToNumaNode = doBindThreads
                                 ? numaConfig.distribute_threads_among_numa_nodes(requested)
                                 : std::vector<NumaIndex>{};
@@ -193,7 +200,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
             counts[0] = requested;  // Pretend all threads are part of numa node 0
         else
         {
-            for (size_t i = 0; i < boundThreadToNumaNode.size(); ++i)
+            for (usize i = 0; i < boundThreadToNumaNode.size(); ++i)
                 counts[boundThreadToNumaNode[i]]++;
         }
 
@@ -201,7 +208,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
         for (auto pair : counts)
         {
             NumaIndex numaIndex = pair.first;
-            uint64_t  count     = pair.second;
+            u64       count     = pair.second;
             auto      f         = [&]() {
                 sharedState.sharedHistories.try_emplace(numaIndex, next_power_of_two(count));
             };
@@ -216,13 +223,11 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
 
         while (threads.size() < requested)
         {
-            const size_t    threadId      = threads.size();
+            const usize     threadId      = threads.size();
             const NumaIndex numaId        = doBindThreads ? boundThreadToNumaNode[threadId] : 0;
             auto            create_thread = [&]() {
-                auto manager = threadId == 0
-                                          ? std::unique_ptr<Search::ISearchManager>(
-                                   std::make_unique<Search::SearchManager>(updateContext))
-                                          : std::make_unique<Search::NullSearchManager>();
+                auto manager =
+                  threadId == 0 ? std::make_unique<Search::SearchManager>(updateContext) : nullptr;
 
                 // When not binding threads we want to force all access to happen
                 // from the same NUMA node, because in case of NUMA replicated memory
@@ -252,7 +257,7 @@ void ThreadPool::set(const NumaConfig&                           numaConfig,
 
 // Sets threadPool data to initial values
 void ThreadPool::clear() {
-    if (threads.size() == 0)
+    if (threads.empty())
         return;
 
     for (auto&& th : threads)
@@ -271,17 +276,17 @@ void ThreadPool::clear() {
     main_manager()->tm.clear();
 }
 
-void ThreadPool::run_on_thread(size_t threadId, std::function<void()> f) {
+void ThreadPool::run_on_thread(usize threadId, std::function<void()> f) {
     assert(threads.size() > threadId);
     threads[threadId]->run_custom_job(std::move(f));
 }
 
-void ThreadPool::wait_on_thread(size_t threadId) {
+void ThreadPool::wait_on_thread(usize threadId) {
     assert(threads.size() > threadId);
     threads[threadId]->wait_for_search_finished();
 }
 
-size_t ThreadPool::num_threads() const { return threads.size(); }
+usize ThreadPool::num_threads() const { return threads.size(); }
 
 
 // Wakes up main thread waiting in idle_loop() and returns immediately.
@@ -299,18 +304,17 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
     increaseDepth = true;
 
     Search::RootMoves rootMoves;
-    const auto        legalmoves = MoveList<LEGAL>(pos);
 
     for (const auto& uciMove : limits.searchmoves)
     {
         auto move = UCIEngine::to_move(pos, uciMove);
 
-        if (std::find(legalmoves.begin(), legalmoves.end(), move) != legalmoves.end())
+        if (move != Move::none())
             rootMoves.emplace_back(move);
     }
 
     if (rootMoves.empty())
-        for (const auto& m : legalmoves)
+        for (const auto& m : MoveList<ALL>(pos))
             rootMoves.emplace_back(m);
 
     Tablebases::Config tbConfig = Tablebases::rank_root_moves(options, pos, rootMoves);
@@ -350,22 +354,17 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
 Thread* ThreadPool::get_best_thread() const {
 
     Thread* bestThread = threads.front().get();
-    Value   minScore   = VALUE_NONE;
+    Value   minScore   = VALUE_INFINITE;
 
-    std::unordered_map<Move, int64_t, Move::MoveHash> votes(
+    std::unordered_map<Move, i64, Move::MoveHash> votes(
       2 * std::min(size(), bestThread->worker->rootMoves.size()));
 
-    // Find the minimum score of all threads
     for (auto&& th : threads)
         minScore = std::min(minScore, th->worker->rootMoves[0].score);
 
-    // Vote according to score and depth, and select the best thread
-    auto thread_voting_value = [minScore](Thread* th) {
-        return (th->worker->rootMoves[0].score - minScore + 14) * int(th->worker->rootDepth);
-    };
-
+    // Vote according to score, and select the best thread
     for (auto&& th : threads)
-        votes[th->worker->rootMoves[0].pv[0]] += thread_voting_value(th.get());
+        votes[th->worker->rootMoves[0].pv[0]] += th->worker->rootMoves[0].score - minScore + 14;
 
     for (auto&& th : threads)
     {
@@ -378,15 +377,10 @@ Thread* ThreadPool::get_best_thread() const {
         // Aborted (d1) searches may lead to inexact win (or loss) scores.
         const bool bestThreadDecisive = bestThreadMove.score != -VALUE_INFINITE
                                      && is_decisive(bestThreadMove.score)
-                                     && !bestThreadMove.score_is_bound();
+                                     && !bestThreadMove.is_inexact();
         const bool newThreadDecisive = newThreadMove.score != -VALUE_INFINITE
                                     && is_decisive(newThreadMove.score)
-                                    && !newThreadMove.score_is_bound();
-
-        // We make sure not to pick a thread with a truncated principal variation.
-        const bool betterVotingValue =
-          thread_voting_value(th.get()) * int(newThreadMove.pv.size() > 2)
-          > thread_voting_value(bestThread) * int(bestThreadMove.pv.size() > 2);
+                                    && !newThreadMove.is_inexact();
 
         if (bestThreadDecisive)
         {
@@ -402,7 +396,8 @@ Thread* ThreadPool::get_best_thread() const {
         else if (newThreadDecisive
                  || (!is_loss(newThreadMove.score)
                      && (newThreadMoveVote > bestThreadMoveVote
-                         || (newThreadMoveVote == bestThreadMoveVote && betterVotingValue))))
+                         || (newThreadMoveVote == bestThreadMoveVote
+                             && newThreadMove.pv.size() > bestThreadMove.pv.size()))))
             bestThread = th.get();
     }
 
@@ -428,12 +423,12 @@ void ThreadPool::wait_for_search_finished() const {
             th->wait_for_search_finished();
 }
 
-std::vector<size_t> ThreadPool::get_bound_thread_to_numa_node() const {
+std::vector<usize> ThreadPool::get_bound_thread_to_numa_node() const {
     return boundThreadToNumaNode;
 }
 
-std::vector<size_t> ThreadPool::get_bound_thread_count_by_numa_node() const {
-    std::vector<size_t> counts;
+std::vector<usize> ThreadPool::get_bound_thread_count_by_numa_node() const {
+    std::vector<usize> counts;
 
     if (!boundThreadToNumaNode.empty())
     {
@@ -451,11 +446,11 @@ std::vector<size_t> ThreadPool::get_bound_thread_count_by_numa_node() const {
     return counts;
 }
 
-size_t ThreadPool::numa_nodes() const {
-    std::unordered_set<size_t> seen;
+usize ThreadPool::numa_nodes() const {
+    std::unordered_set<usize> seen;
     for (NumaIndex n : boundThreadToNumaNode)
         seen.insert(n);
-    return std::max(seen.size(), size_t(1));
+    return std::max(seen.size(), usize(1));
 }
 
 void ThreadPool::ensure_network_replicated() {

@@ -34,26 +34,26 @@
     #include <unistd.h>
 
 // Must be kept in sync with patch_x86_slice.sh
-extern const volatile uint64_t gUniversalNNUEOffset = 0xCAFE0FF5E70FF5E7ULL;
-extern const volatile uint64_t gUniversalNNUESize   = 0xCAFE512ECAFE512EULL;
+extern const volatile Stockfish::u64 gUniversalNNUEOffset = 0xCAFE0FF5E70FF5E7ULL;
+extern const volatile Stockfish::u64 gUniversalNNUESize   = 0xCAFE512ECAFE512EULL;
 
 static const unsigned char* map_embedded_nnue() {
-    char     path[PATH_MAX];
-    uint32_t len = sizeof(path);
+    char           path[PATH_MAX];
+    Stockfish::u32 len = sizeof(path);
     if (_NSGetExecutablePath(path, &len) != 0)
         return nullptr;
 
     char        resolved[PATH_MAX];
     const char* file = realpath(path, resolved) ? resolved : path;
 
-    int fd = open(file, O_RDONLY);
+    int fd = open(file, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return nullptr;
 
     // Align down to page size for mmap
-    const uint64_t pageSize = uint64_t(sysconf(_SC_PAGESIZE));
-    const uint64_t base     = gUniversalNNUEOffset & ~(pageSize - 1);
-    const uint64_t pad      = gUniversalNNUEOffset - base;
+    const Stockfish::u64 pageSize = Stockfish::u64(sysconf(_SC_PAGESIZE));
+    const Stockfish::u64 base     = gUniversalNNUEOffset & ~(pageSize - 1);
+    const Stockfish::u64 pad      = gUniversalNNUEOffset - base;
 
     void* p =
       mmap(nullptr, size_t(gUniversalNNUESize + pad), PROT_READ, MAP_PRIVATE, fd, off_t(base));
